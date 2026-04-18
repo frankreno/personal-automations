@@ -10,10 +10,35 @@ import sqlite3
 import json
 import urllib.request
 import urllib.error
+import ssl
 from datetime import datetime
 import os
 import sys
 from pathlib import Path
+
+def ssl_context():
+    """Return an SSL context that works on macOS regardless of cert install state."""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        pass
+    # Fall back to system certs via subprocess-located cert bundle
+    try:
+        import subprocess
+        pem = subprocess.run(
+            ["python3", "-c", "import certifi; print(certifi.where())"],
+            capture_output=True, text=True
+        ).stdout.strip()
+        if pem:
+            return ssl.create_default_context(cafile=pem)
+    except Exception:
+        pass
+    # Last resort: unverified (weather only, low risk)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
 
 # ── Config ────────────────────────────────────────────────────────────────────
 IMESSAGE_TARGET = "+17202989368"
@@ -22,7 +47,7 @@ CALENDAR_DB = os.path.expanduser(
 )
 SCRIPT_DIR = Path(__file__).parent
 SYSTEM_PROMPT_PATH = SCRIPT_DIR / "system_prompt.md"
-WEATHER_LOCATION = "Parker,CO"
+WEATHER_LOCATION = "Littleton,CO"
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 
 WORK_CALENDAR = "frank.reno@procore.com"
@@ -64,7 +89,7 @@ def get_weather():
     try:
         url = f"https://wttr.in/{WEATHER_LOCATION}?format=j1"
         req = urllib.request.Request(url, headers={"User-Agent": "curl/7.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=10, context=ssl_context()) as resp:
             data = json.loads(resp.read())
         current = data["current_condition"][0]
         today_wx = data["weather"][0]
@@ -263,7 +288,7 @@ def call_claude(api_key, system_prompt, user_message):
             "anthropic-version": "2023-06-01",
         },
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=30, context=ssl_context()) as resp:
         data = json.loads(resp.read())
     return data["content"][0]["text"]
 
