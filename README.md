@@ -23,7 +23,7 @@ Morning briefing delivered via iMessage at **6:00 AM every day**.
 
 **What it covers:**
 - Opening narrative — what kind of day is it?
-- Weather (Parker, CO)
+- Weather (Littleton, CO)
 - Work: boss meetings (Michael Marfise, Abe Fathman), external attendees, conflicts, pacing — weekdays only, skipped entirely on weekends
 - Personal/family events worth knowing
 - Reminders due today + overdue (Family, Work, Reminders lists)
