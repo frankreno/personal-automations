@@ -11,7 +11,7 @@ import json
 import urllib.request
 import urllib.error
 import ssl
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import sys
 from pathlib import Path
@@ -189,12 +189,14 @@ def get_calendar_events(target_date):
             attendees = get_attendees(conn, row["ROWID"])
 
         # Flag boss and external attendees
-        boss_names = {"michael marfise", "abe fathman"}
-        has_boss = any(
-            a["name"].lower() in boss_names or
-            any(b in a["email"].lower() for b in ["marfise", "fathman"])
-            for a in attendees
-        )
+        boss_names_set = {"michael marfise", "abe fathman"}
+        boss_substrs = ["marfise", "fathman"]
+        boss_attendees = []
+        for a in attendees:
+            name_lower = a["name"].lower()
+            email_lower = a["email"].lower()
+            if name_lower in boss_names_set or any(b in email_lower for b in boss_substrs):
+                boss_attendees.append(a["name"] or a["email"])
         external_attendees = [
             a for a in attendees
             if a["email"] and "@procore.com" not in a["email"].lower()
@@ -212,7 +214,9 @@ def get_calendar_events(target_date):
             "is_work": row["calendar_name"] == WORK_CALENDAR,
             "utility_block": is_utility_block(summary),
             "has_attendees": bool(row["has_attendees"]),
-            "has_boss": has_boss,
+            "attendee_count": len(attendees),
+            "has_boss": bool(boss_attendees),
+            "boss_attendees": boss_attendees,
             "external_attendees": [a["email"] or a["name"] for a in external_attendees],
             "has_video": bool(row["conference_url"]),
             "invitation_status": row["invitation_status"],
@@ -222,6 +226,69 @@ def get_calendar_events(target_date):
 
     conn.close()
     return events
+
+
+# ── Derived metrics ───────────────────────────────────────────────────────────
+def compute_conflicts(events):
+    """Annotate each event with conflicts_with: summaries of overlapping real events."""
+    for e in events:
+        e["conflicts_with"] = []
+    real = [e for e in events if not e["all_day"] and not e["utility_block"]]
+    for i, a in enumerate(real):
+        for b in real[i + 1:]:
+            if a["start_minutes"] < b["end_minutes"] and b["start_minutes"] < a["end_minutes"]:
+                a["conflicts_with"].append(b["summary"])
+                b["conflicts_with"].append(a["summary"])
+
+
+def compute_anchors(events, now):
+    """Return (first_meeting, last_meeting, minutes_until_first) for non-utility events."""
+    real = [e for e in events if not e["all_day"] and not e["utility_block"]]
+    if not real:
+        return None, None, None
+    first = real[0]
+    last = max(real, key=lambda e: e["end_minutes"])
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    first_dt = midnight + timedelta(minutes=first["start_minutes"])
+    minutes_until = int((first_dt - now).total_seconds() // 60)
+    return (
+        {"summary": first["summary"], "start": first["start"]},
+        {"summary": last["summary"], "end": last["end"]},
+        minutes_until,
+    )
+
+
+def compute_back_to_back_hours(events):
+    """Longest contiguous run of non-utility events with ≤15 min gaps, in hours."""
+    real = sorted(
+        [e for e in events if not e["all_day"] and not e["utility_block"]],
+        key=lambda e: e["start_minutes"],
+    )
+    if not real:
+        return 0.0
+    longest = 0
+    run_start = real[0]["start_minutes"]
+    run_end = real[0]["end_minutes"]
+    for e in real[1:]:
+        if e["start_minutes"] - run_end <= 15:
+            run_end = max(run_end, e["end_minutes"])
+        else:
+            longest = max(longest, run_end - run_start)
+            run_start = e["start_minutes"]
+            run_end = e["end_minutes"]
+    longest = max(longest, run_end - run_start)
+    return round(longest / 60, 1)
+
+
+def log_attendee_diagnostics(events):
+    """Print per-event attendee counts to stderr so silent schema failures are diagnosable."""
+    for e in events:
+        print(
+            f"[attendees] {e['summary'][:60]}: "
+            f"count={e['attendee_count']} boss={e['boss_attendees']} "
+            f"external={len(e['external_attendees'])}",
+            file=sys.stderr,
+        )
 
 
 # ── Reminders ─────────────────────────────────────────────────────────────────
@@ -320,12 +387,21 @@ def main():
     events = get_calendar_events(now)
     reminders = get_reminders()
 
+    compute_conflicts(events)
+    first_meeting, last_meeting, minutes_until_first = compute_anchors(events, now)
+    back_to_back_hours = compute_back_to_back_hours(events)
+    log_attendee_diagnostics(events)
+
     context = {
         "date": now.strftime("%A, %B %-d, %Y"),
         "is_weekend": is_weekend,
         "weather": weather,
         "events": events,
         "reminders": reminders,
+        "first_meeting": first_meeting,
+        "last_meeting": last_meeting,
+        "minutes_until_first_meeting": minutes_until_first,
+        "back_to_back_hours": back_to_back_hours,
     }
 
     user_message = (

@@ -13,12 +13,15 @@ Help Frank prepare for his day. Not an exhaustive list of everything — just wh
 ## Format
 
 1. **Opening narrative** (2–4 sentences) — what kind of day is this? Busy, light, mixed? Any headline things worth knowing before he starts?
+   - **Always anchor the day**: state the time of his first meeting and his last meeting (use the `first_meeting` and `last_meeting` fields), e.g. *"Meetings run 9am–1pm."*
+   - **On weekdays with meetings**, also state how long until his first meeting using `minutes_until_first_meeting` (e.g. *"first one in 3h"*). If it's already started or passed, skip this.
+   - For pacing language, use the pre-computed `back_to_back_hours` value verbatim (e.g. *"4 hours back-to-back"*) instead of estimating.
 2. **🌤 Weather** — one line. High/low, and only flag precip if there's meaningful chance of it.
 3. **💼 Work** — weekdays only. Skip this section entirely on weekends. Do NOT say "no work events today" — just omit it.
-   - Flag any meeting with **Michael Marfise** or **Abe Fathman** (Frank's two bosses)
-   - Flag any **external meetings** (attendees with non-@procore.com email addresses)
-   - Call out any **conflicts** (overlapping events)
-   - Give a read on **pacing**: back-to-back grind, or does he have focus blocks / breathing room?
+   - **Boss meetings**: when an event has `boss_attendees` populated, prefix that line with `🎯 BOSS (<name>)` and mention the boss by name in the narrative too. Example detail line: `🎯 BOSS (Michael Marfise) 12:00pm – Runtime Evolutions Debrief`.
+   - **External meetings**: flag attendees with non-@procore.com email addresses.
+   - **Conflicts**: when an event has `conflicts_with` populated, prefix that event's detail line with `⚠️ CONFLICT (with "<other summary>")`. Also call the conflict out in the opening narrative.
+   - **Pacing**: reference the `back_to_back_hours` metric.
 4. **🏠 Personal** — events from Family and personal Calendar worth knowing about. Skip routine logistics (kid school pickup, etc.) unless they conflict with a work commitment.
 5. **✅ Reminders** — overdue first, then due today. Omit section entirely if empty.
 
