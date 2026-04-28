@@ -13,8 +13,9 @@ import urllib.error
 import ssl
 import logging
 import traceback
+import glob
 from logging.handlers import RotatingFileHandler
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import sys
 from pathlib import Path
@@ -64,6 +65,9 @@ IMESSAGE_TARGET = "+17202989368"
 CALENDAR_DB = os.path.expanduser(
     "~/Library/Group Containers/group.com.apple.calendar/Calendar.sqlitedb"
 )
+REMINDERS_STORES_DIR = os.path.expanduser(
+    "~/Library/Group Containers/group.com.apple.reminders/Container_v1/Stores"
+)
 SYSTEM_PROMPT_PATH = SCRIPT_DIR / "system_prompt.md"
 WEATHER_LOCATION = "Littleton,CO"
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
@@ -72,13 +76,15 @@ WORK_CALENDAR = "frank.reno@procore.com"
 PERSONAL_CALENDARS = {"Calendar", "Family"}
 ALL_CALENDARS = {WORK_CALENDAR} | PERSONAL_CALENDARS
 
+# Reminders lists to surface in the briefing (lowercased for case-insensitive match)
+TARGET_REMINDER_LISTS = {"family", "work", "reminders"}
+
 SKIP_PATTERNS = [
     "lunch", "ask before scheduling", "focus time", "no meeting",
     "⛔", "hold", "blocked", "school pickup", "pickup",
 ]
 
 APPLE_EPOCH = 978307200  # seconds between Unix epoch and Apple's Jan 1 2001
-REMINDERS_TIMEOUT = 45   # seconds — Family list (~600 items) takes ~11s alone via AppleScript
 IMESSAGE_TIMEOUT = 15    # seconds — Messages send is fast
 
 
@@ -257,67 +263,100 @@ def get_calendar_events(target_date):
     return events
 
 
-# ── Reminders ─────────────────────────────────────────────────────────────────
-def get_reminders():
-    script = '''
-tell application "Reminders"
-    set output to ""
-    set targetLists to {"Family", "Work", "Reminders"}
-    set today to current date
-    set todayStart to today - (time of today)
-    set tomorrow to todayStart + (1 * days)
-    repeat with listName in targetLists
-        try
-            set rl to list listName
-            set rems to (every reminder of rl whose completed is false)
-            repeat with r in rems
-                try
-                    set dd to due date of r
-                    if dd < tomorrow then
-                        set overdue to ""
-                        if dd < todayStart then set overdue to "OVERDUE"
-                        set output to output & listName & "|" & (name of r) & "|" & overdue & linefeed
-                    end if
-                on error
-                    -- no due date, skip
-                end try
-            end repeat
-        end try
-    end repeat
-    return output
-end tell
-'''
-    try:
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, text=True,
-            timeout=REMINDERS_TIMEOUT,
+# ── Reminders (SQLite — replaces the old AppleScript version) ─────────────────
+def _find_reminders_db():
+    """Return the path to the largest Reminders Core Data store (the active one)."""
+    candidates = glob.glob(os.path.join(REMINDERS_STORES_DIR, "Data-*.sqlite"))
+    if not candidates:
+        raise FileNotFoundError(
+            f"No Reminders sqlite stores found in {REMINDERS_STORES_DIR}"
         )
-    except subprocess.TimeoutExpired:
+    # The largest store is the iCloud account; smaller ones are typically empty/local
+    return max(candidates, key=os.path.getsize)
+
+
+def get_reminders():
+    """
+    Pull incomplete reminders due today or earlier from the Reminders Core Data
+    store. Bypasses AppleScript entirely — instant and immune to Reminders.app
+    sync stalls.
+
+    Schema (macOS Sonoma+):
+      ZREMCDREMINDER:  reminder rows. Uses Apple epoch in ZDUEDATE.
+      ZREMCDOBJECT:    holds lists (and sections); ZNAME1 is the display name.
+      ZLIST:           FK from reminder to its list's Z_PK in ZREMCDOBJECT.
+    """
+    db_path = _find_reminders_db()
+
+    # Open read-only so we can never accidentally corrupt the live store.
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.OperationalError as e:
+        raise PermissionError(
+            f"Cannot open Reminders DB at {db_path} ({e}). "
+            f"Likely missing Full Disk Access for {sys.executable}."
+        )
+    conn.row_factory = sqlite3.Row
+
+    # Auto-discover the title column — Apple has used different names across versions
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(ZREMCDREMINDER)").fetchall()]
+    title_col = next(
+        (c for c in ("ZTITLE", "ZTITLE1", "ZNAME", "ZSUMMARY") if c in cols),
+        None,
+    )
+    if not title_col:
+        z_cols = [c for c in cols if c.startswith("Z") and not c.startswith("ZCK")]
+        conn.close()
         raise RuntimeError(
-            f"Reminders AppleScript timed out after {REMINDERS_TIMEOUT}s — "
-            f"either missing Automation permission for {sys.executable} → Reminders, "
-            f"or the Family list has grown so large the 'whose' filter is exceeding the budget."
+            f"No known title column in ZREMCDREMINDER. "
+            f"Z* columns present: {z_cols[:30]}"
         )
 
-    if result.returncode != 0:
-        stderr = result.stderr.strip() or result.stdout.strip() or "(no output)"
+    now = datetime.now()
+    today_start = datetime(now.year, now.month, now.day)
+    tomorrow = today_start + timedelta(days=1)
+    tomorrow_apple = tomorrow.timestamp() - APPLE_EPOCH
+
+    placeholders = ",".join("?" * len(TARGET_REMINDER_LISTS))
+    query = f"""
+        SELECT
+            r.{title_col} AS title,
+            r.ZDUEDATE     AS due_apple,
+            l.ZNAME1       AS list_name
+        FROM ZREMCDREMINDER r
+        LEFT JOIN ZREMCDOBJECT l ON r.ZLIST = l.Z_PK
+        WHERE r.ZCOMPLETED = 0
+          AND COALESCE(r.ZMARKEDFORDELETION, 0) = 0
+          AND r.ZDUEDATE IS NOT NULL
+          AND r.ZDUEDATE < ?
+          AND LOWER(l.ZNAME1) IN ({placeholders})
+        ORDER BY r.ZDUEDATE
+    """
+
+    try:
+        rows = conn.execute(
+            query,
+            [tomorrow_apple] + list(TARGET_REMINDER_LISTS)
+        ).fetchall()
+    except sqlite3.OperationalError as e:
+        conn.close()
         raise RuntimeError(
-            f"Reminders osascript failed (rc={result.returncode}): {stderr}"
+            f"Reminders query failed ({e}). Schema may have changed; "
+            f"used title column '{title_col}'."
         )
+    conn.close()
 
     reminders = []
-    if result.stdout.strip():
-        for line in result.stdout.strip().split("\n"):
-            if not line.strip():
-                continue
-            parts = line.split("|")
-            if len(parts) >= 2:
-                reminders.append({
-                    "list": parts[0],
-                    "title": parts[1],
-                    "overdue": len(parts) > 2 and parts[2] == "OVERDUE",
-                })
+    for row in rows:
+        try:
+            due_dt = apple_ts_to_dt(row["due_apple"])
+        except Exception:
+            continue
+        reminders.append({
+            "list": row["list_name"] or "",
+            "title": row["title"] or "(no title)",
+            "overdue": due_dt < today_start,
+        })
     return reminders
 
 
