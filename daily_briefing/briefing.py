@@ -78,7 +78,8 @@ SKIP_PATTERNS = [
 ]
 
 APPLE_EPOCH = 978307200  # seconds between Unix epoch and Apple's Jan 1 2001
-REMINDERS_TIMEOUT = 15   # seconds — also used for iMessage send
+REMINDERS_TIMEOUT = 45   # seconds — Family list (~600 items) takes ~11s alone via AppleScript
+IMESSAGE_TIMEOUT = 15    # seconds — Messages send is fast
 
 
 # ── Safe fetch wrapper ────────────────────────────────────────────────────────
@@ -295,7 +296,8 @@ end tell
     except subprocess.TimeoutExpired:
         raise RuntimeError(
             f"Reminders AppleScript timed out after {REMINDERS_TIMEOUT}s — "
-            f"likely missing Automation permission for {sys.executable} → Reminders."
+            f"either missing Automation permission for {sys.executable} → Reminders, "
+            f"or the Family list has grown so large the 'whose' filter is exceeding the budget."
         )
 
     if result.returncode != 0:
@@ -360,11 +362,11 @@ end tell
         result = subprocess.run(
             ["osascript", "-e", script],
             capture_output=True, text=True,
-            timeout=REMINDERS_TIMEOUT,
+            timeout=IMESSAGE_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError(
-            f"iMessage send timed out after {REMINDERS_TIMEOUT}s — "
+            f"iMessage send timed out after {IMESSAGE_TIMEOUT}s — "
             f"likely missing Automation permission for {sys.executable} → Messages."
         )
     if result.returncode != 0:
