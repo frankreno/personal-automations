@@ -11,10 +11,31 @@ import json
 import urllib.request
 import urllib.error
 import ssl
+import logging
+import traceback
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 import os
 import sys
 from pathlib import Path
+
+# ── Logging setup ─────────────────────────────────────────────────────────────
+SCRIPT_DIR = Path(__file__).parent
+LOG_PATH = SCRIPT_DIR / "briefing.log"
+
+logger = logging.getLogger("briefing")
+logger.setLevel(logging.INFO)
+_handler = RotatingFileHandler(LOG_PATH, maxBytes=512_000, backupCount=3)
+_handler.setFormatter(logging.Formatter(
+    "[%(asctime)s] %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+))
+logger.addHandler(_handler)
+# Also stream to stderr so launchd's StandardErrorPath catches it as a backup
+_stream = logging.StreamHandler(sys.stderr)
+_stream.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+logger.addHandler(_stream)
+
 
 def ssl_context():
     """Return an SSL context that works on macOS regardless of cert install state."""
@@ -23,9 +44,7 @@ def ssl_context():
         return ssl.create_default_context(cafile=certifi.where())
     except ImportError:
         pass
-    # Fall back to system certs via subprocess-located cert bundle
     try:
-        import subprocess
         pem = subprocess.run(
             ["python3", "-c", "import certifi; print(certifi.where())"],
             capture_output=True, text=True
@@ -34,18 +53,17 @@ def ssl_context():
             return ssl.create_default_context(cafile=pem)
     except Exception:
         pass
-    # Last resort: unverified (weather only, low risk)
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     return ctx
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 IMESSAGE_TARGET = "+17202989368"
 CALENDAR_DB = os.path.expanduser(
     "~/Library/Group Containers/group.com.apple.calendar/Calendar.sqlitedb"
 )
-SCRIPT_DIR = Path(__file__).parent
 SYSTEM_PROMPT_PATH = SCRIPT_DIR / "system_prompt.md"
 WEATHER_LOCATION = "Littleton,CO"
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
@@ -54,20 +72,27 @@ WORK_CALENDAR = "frank.reno@procore.com"
 PERSONAL_CALENDARS = {"Calendar", "Family"}
 ALL_CALENDARS = {WORK_CALENDAR} | PERSONAL_CALENDARS
 
-# Utility blocks to skip (unless an accepted meeting is inside the window)
 SKIP_PATTERNS = [
-    "lunch",
-    "ask before scheduling",
-    "focus time",
-    "no meeting",
-    "⛔",
-    "hold",
-    "blocked",
-    "school pickup",
-    "pickup",
+    "lunch", "ask before scheduling", "focus time", "no meeting",
+    "⛔", "hold", "blocked", "school pickup", "pickup",
 ]
 
 APPLE_EPOCH = 978307200  # seconds between Unix epoch and Apple's Jan 1 2001
+REMINDERS_TIMEOUT = 15   # seconds — also used for iMessage send
+
+
+# ── Safe fetch wrapper ────────────────────────────────────────────────────────
+def safe_fetch(name, fn, *args, **kwargs):
+    """Run a fetcher; return (data, error_string_or_None). Logs on failure."""
+    try:
+        result = fn(*args, **kwargs)
+        logger.info(f"{name}: OK")
+        return result, None
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        logger.error(f"{name} failed: {err}")
+        logger.error(traceback.format_exc())
+        return None, f"{name}: {err}"
 
 
 # ── Keychain ──────────────────────────────────────────────────────────────────
@@ -79,32 +104,31 @@ def get_api_key():
     )
     if result.returncode != 0:
         raise RuntimeError(
-            "Claude API key not found in Keychain. Run setup.sh first."
+            f"Claude API key not found in Keychain. "
+            f"stderr: {result.stderr.strip() or '(empty)'}"
         )
     return result.stdout.strip()
 
 
 # ── Weather ───────────────────────────────────────────────────────────────────
 def get_weather():
-    try:
-        url = f"https://wttr.in/{WEATHER_LOCATION}?format=j1"
-        req = urllib.request.Request(url, headers={"User-Agent": "curl/7.0"})
-        with urllib.request.urlopen(req, timeout=10, context=ssl_context()) as resp:
-            data = json.loads(resp.read())
-        current = data["current_condition"][0]
-        today_wx = data["weather"][0]
-        hourly_midday = today_wx["hourly"][4]
-        return {
-            "temp_f": current["temp_F"],
-            "feels_like_f": current["FeelsLikeF"],
-            "desc": current["weatherDesc"][0]["value"],
-            "high_f": today_wx["maxtempF"],
-            "low_f": today_wx["mintempF"],
-            "precip_chance_pct": hourly_midday.get("chanceofrain", "0"),
-            "snow_chance_pct": hourly_midday.get("chanceofsnow", "0"),
-        }
-    except Exception as e:
-        return {"error": str(e)}
+    """Fetch weather from wttr.in. Raises on failure (caught by safe_fetch)."""
+    url = f"https://wttr.in/{WEATHER_LOCATION}?format=j1"
+    req = urllib.request.Request(url, headers={"User-Agent": "curl/7.0"})
+    with urllib.request.urlopen(req, timeout=10, context=ssl_context()) as resp:
+        data = json.loads(resp.read())
+    current = data["current_condition"][0]
+    today_wx = data["weather"][0]
+    hourly_midday = today_wx["hourly"][4]
+    return {
+        "temp_f": current["temp_F"],
+        "feels_like_f": current["FeelsLikeF"],
+        "desc": current["weatherDesc"][0]["value"],
+        "high_f": today_wx["maxtempF"],
+        "low_f": today_wx["mintempF"],
+        "precip_chance_pct": hourly_midday.get("chanceofrain", "0"),
+        "snow_chance_pct": hourly_midday.get("chanceofsnow", "0"),
+    }
 
 
 # ── Calendar ──────────────────────────────────────────────────────────────────
@@ -131,7 +155,6 @@ def get_attendees(conn, item_rowid):
             return [{"email": r[0] or "", "name": r[1] or ""} for r in rows]
         except sqlite3.OperationalError:
             continue
-    # Fallback: try Identity-based join if Participant doesn't exist
     try:
         rows = conn.execute("""
             SELECT i.email, i.display_name
@@ -144,7 +167,18 @@ def get_attendees(conn, item_rowid):
 
 
 def get_calendar_events(target_date):
-    conn = sqlite3.connect(CALENDAR_DB)
+    if not os.path.exists(CALENDAR_DB):
+        raise FileNotFoundError(f"Calendar.sqlitedb not found at {CALENDAR_DB}")
+
+    try:
+        conn = sqlite3.connect(CALENDAR_DB)
+    except sqlite3.OperationalError as e:
+        # Most common cause: Full Disk Access not granted to the running Python binary
+        raise PermissionError(
+            f"Cannot open Calendar.sqlitedb ({e}). "
+            f"Likely missing Full Disk Access for {sys.executable}."
+        )
+
     conn.row_factory = sqlite3.Row
 
     start_unix = datetime(
@@ -188,7 +222,6 @@ def get_calendar_events(target_date):
         if row["has_attendees"]:
             attendees = get_attendees(conn, row["ROWID"])
 
-        # Flag boss and external attendees
         boss_names = {"michael marfise", "abe fathman"}
         has_boss = any(
             a["name"].lower() in boss_names or
@@ -216,7 +249,6 @@ def get_calendar_events(target_date):
             "external_attendees": [a["email"] or a["name"] for a in external_attendees],
             "has_video": bool(row["conference_url"]),
             "invitation_status": row["invitation_status"],
-            # truncate description to keep tokens down
             "description": (row["description"] or "")[:150],
         })
 
@@ -254,9 +286,26 @@ tell application "Reminders"
     return output
 end tell
 '''
-    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True,
+            timeout=REMINDERS_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"Reminders AppleScript timed out after {REMINDERS_TIMEOUT}s — "
+            f"likely missing Automation permission for {sys.executable} → Reminders."
+        )
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip() or result.stdout.strip() or "(no output)"
+        raise RuntimeError(
+            f"Reminders osascript failed (rc={result.returncode}): {stderr}"
+        )
+
     reminders = []
-    if result.returncode == 0 and result.stdout.strip():
+    if result.stdout.strip():
         for line in result.stdout.strip().split("\n"):
             if not line.strip():
                 continue
@@ -288,8 +337,12 @@ def call_claude(api_key, system_prompt, user_message):
             "anthropic-version": "2023-06-01",
         },
     )
-    with urllib.request.urlopen(req, timeout=30, context=ssl_context()) as resp:
-        data = json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=ssl_context()) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")[:500]
+        raise RuntimeError(f"Claude API HTTP {e.code}: {body}")
     return data["content"][0]["text"]
 
 
@@ -303,51 +356,86 @@ tell application "Messages"
     send "{escaped}" to targetBuddy
 end tell
 '''
-    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True,
+            timeout=REMINDERS_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"iMessage send timed out after {REMINDERS_TIMEOUT}s — "
+            f"likely missing Automation permission for {sys.executable} → Messages."
+        )
     if result.returncode != 0:
-        raise RuntimeError(f"iMessage send failed: {result.stderr.strip()}")
+        stderr = result.stderr.strip() or "(no stderr)"
+        raise RuntimeError(f"iMessage send failed (rc={result.returncode}): {stderr}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-def main():
+def run_briefing():
     now = datetime.now()
     is_weekend = now.weekday() >= 5
 
-    print(f"[{now.strftime('%Y-%m-%d %H:%M')}] Starting daily briefing...")
+    logger.info(f"Starting daily briefing for {now.strftime('%Y-%m-%d %H:%M')}")
+    logger.info(f"Python: {sys.executable}")
+
+    # Fetch each source independently — partial failure is OK
+    weather, wx_err = safe_fetch("weather", get_weather)
+    events, cal_err = safe_fetch("calendar", get_calendar_events, now)
+    reminders, rem_err = safe_fetch("reminders", get_reminders)
+
+    errors = [e for e in (wx_err, cal_err, rem_err) if e]
+
+    # If literally everything failed, abort — no point hitting the LLM
+    if weather is None and events is None and reminders is None:
+        raise RuntimeError(
+            "All data sources failed. Errors: " + " | ".join(errors)
+        )
 
     system_prompt = SYSTEM_PROMPT_PATH.read_text()
-    weather = get_weather()
-    events = get_calendar_events(now)
-    reminders = get_reminders()
-
     context = {
         "date": now.strftime("%A, %B %-d, %Y"),
         "is_weekend": is_weekend,
-        "weather": weather,
-        "events": events,
-        "reminders": reminders,
+        "weather": weather if weather is not None else {"unavailable": wx_err},
+        "events": events if events is not None else {"unavailable": cal_err},
+        "reminders": reminders if reminders is not None else {"unavailable": rem_err},
+        "data_source_errors": errors,
     }
 
     user_message = (
-        "Here is today's data. Generate my morning briefing.\n\n"
-        + json.dumps(context, indent=2)
+        "Here is today's data. Generate my morning briefing.\n"
+        "If any data sources are marked unavailable or appear in "
+        "data_source_errors, briefly mention what's missing rather than "
+        "fabricating it.\n\n"
+        + json.dumps(context, indent=2, default=str)
     )
 
     api_key = get_api_key()
     briefing = call_claude(api_key, system_prompt, user_message)
 
-    print("Briefing:\n" + briefing)
+    logger.info(f"Briefing generated ({len(briefing)} chars)")
     send_imessage(briefing, IMESSAGE_TARGET)
-    print("Sent.")
+    logger.info("Briefing sent successfully.")
+
+
+def main():
+    try:
+        run_briefing()
+    except Exception as e:
+        err_type = type(e).__name__
+        logger.error(f"FATAL {err_type}: {e}")
+        logger.error(traceback.format_exc())
+        # Send the actual error type and message — never just "authorization denied"
+        try:
+            send_imessage(
+                f"⚠️ Daily briefing FATAL\n{err_type}: {str(e)[:300]}",
+                IMESSAGE_TARGET,
+            )
+        except Exception as send_err:
+            logger.error(f"Could not send error iMessage either: {send_err}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        try:
-            send_imessage(f"⚠️ Daily briefing failed: {e}", IMESSAGE_TARGET)
-        except Exception:
-            pass
-        sys.exit(1)
+    main()
